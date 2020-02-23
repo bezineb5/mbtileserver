@@ -1,6 +1,7 @@
 module github.com/consbio/mbtileserver
 
 require (
+	github.com/alicebob/sqlittle v1.3.0
 	github.com/certifi/gocertifi v0.0.0-20190105021004-abcd57078448 // indirect
 	github.com/evalphobia/logrus_sentry v0.8.2
 	github.com/getsentry/raven-go v0.2.0 // indirect

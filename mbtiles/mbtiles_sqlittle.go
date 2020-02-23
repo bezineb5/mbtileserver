@@ -1,22 +1,20 @@
-// +build cgo
+// +build !cgo
 
 package mbtiles
 
 import (
 	"bytes"
-	"compress/gzip"
-	"compress/zlib"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3" // import sqlite3 driver
+	"github.com/alicebob/sqlittle"
+	sdb "github.com/alicebob/sqlittle/db"
 )
 
 // TileFormat is an enum that defines the tile format of a tile
@@ -76,12 +74,13 @@ func (t TileFormat) ContentType() string {
 
 // DB represents an mbtiles file connection.
 type DB struct {
-	filename           string     // name of tile mbtiles file
-	db                 *sql.DB    // database connection for mbtiles file
-	tileformat         TileFormat // tile format: PNG, JPG, PBF, WEBP
-	timestamp          time.Time  // timestamp of file, for cache control headers
-	hasUTFGrid         bool       // true if mbtiles file contains additional tables with UTFGrid data
-	utfgridCompression TileFormat // compression (GZIP or ZLIB) of UTFGrids
+	filename           string       // name of tile mbtiles file
+	db                 *sqlittle.DB // database connection for mbtiles file
+	mux                sync.Mutex   // Mutex for sqlittle database operations
+	tileformat         TileFormat   // tile format: PNG, JPG, PBF, WEBP
+	timestamp          time.Time    // timestamp of file, for cache control headers
+	hasUTFGrid         bool         // true if mbtiles file contains additional tables with UTFGrid data
+	utfgridCompression TileFormat   // compression (GZIP or ZLIB) of UTFGrids
 }
 
 // NewDB creates a new DB instance.
@@ -94,26 +93,42 @@ func NewDB(filename string) (*DB, error) {
 		return nil, fmt.Errorf("could not read file stats for mbtiles file: %s\n", filename)
 	}
 
-	db, err := sql.Open("sqlite3", filename)
+	lowLevelDb, err := sdb.OpenFile(filename)
 	if err != nil {
 		return nil, err
 	}
+	defer lowLevelDb.Close()
 
 	//Validate the mbtiles file
 	//'tiles', 'metadata' tables or views must be present
-	var tableCount int
-	err = db.QueryRow("SELECT count(*) FROM sqlite_master WHERE name in ('tiles', 'metadata')").Scan(&tableCount)
+	tileTable, err := lowLevelDb.Table("tiles")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("Missing required table: 'tiles'")
 	}
-
-	if tableCount < 2 {
-		return nil, fmt.Errorf("Missing required table: 'tiles' or 'metadata'")
+	_, err = lowLevelDb.Table("metadata")
+	if err != nil {
+		return nil, fmt.Errorf("Missing required table: 'metadata'")
+	}
+	_, err = lowLevelDb.Index("tile_index")
+	if err != nil {
+		return nil, fmt.Errorf("Missing required index: 'tile_index'")
 	}
 
 	//query a sample tile to determine format
 	var data []byte
-	err = db.QueryRow("select tile_data from tiles limit 1").Scan(&data)
+	/* err = db.QueryRow("select tile_data from tiles limit 1").Scan(&data) */
+	tilesSchema, err := lowLevelDb.Schema("tiles")
+	tileDataColIndex := tilesSchema.Column("tile_data")
+	if err := tileTable.Scan(
+		func(rowid int64, rec sdb.Record) bool {
+			fmt.Printf("row %d\n", rowid)
+			data = rec[tileDataColIndex].([]byte) // To check against the schema
+			return true                           // Stop at first row
+		},
+	); err != nil {
+		panic(err)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +139,12 @@ func NewDB(filename string) (*DB, error) {
 	if tileformat == GZIP {
 		tileformat = PBF // GZIP masks PBF, which is only expected type for tiles in GZIP format
 	}
+
+	db, err := sqlittle.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+
 	out := DB{
 		db:         db,
 		tileformat: tileformat,
@@ -139,7 +160,7 @@ func NewDB(filename string) (*DB, error) {
 	// For this reason, we query data directly from 'grid_utfgrid' to determine if any grids are present.
 	// NOTE: this assumption may not be valid for all mbtiles files, since grid_utfgrid is used by convention
 	// rather than specification.
-	var count int
+	/*var count int
 	err = db.QueryRow("select count(*) from sqlite_master where name in ('grids', 'grid_data', 'grid_utfgrid', 'keymap', 'grid_key')").Scan(&count)
 	if err != nil {
 		return nil, err
@@ -160,7 +181,7 @@ func NewDB(filename string) (*DB, error) {
 				return nil, fmt.Errorf("could not determine UTF Grid compression type: %v", err)
 			}
 		}
-	}
+	}*/
 
 	return &out, nil
 
@@ -169,14 +190,22 @@ func NewDB(filename string) (*DB, error) {
 // ReadTile reads a tile with tile identifiers z, x, y into provided *[]byte.
 // data will be nil if the tile does not exist in the database
 func (tileset *DB) ReadTile(z uint8, x uint64, y uint64, data *[]byte) error {
-	err := tileset.db.QueryRow("select tile_data from tiles where zoom_level = ? and tile_column = ? and tile_row = ?", z, x, y).Scan(data)
+	tileset.mux.Lock()
+	defer tileset.mux.Unlock()
+
+	err := tileset.db.IndexedSelectEq(
+		"tiles",
+		"tile_index",
+		sqlittle.Key{int64(z), int64(x), int64(y)},
+		func(r sqlittle.Row) {
+			_ = r.Scan(data)
+		},
+		"tile_data",
+	)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			*data = nil // If this tile does not exist in the database, return empty bytes
-			return nil
-		}
 		return err
 	}
+
 	return nil
 }
 
@@ -189,7 +218,7 @@ func (tileset *DB) ReadGrid(z uint8, x uint64, y uint64, data *[]byte) error {
 		return errors.New("Tileset does not contain UTFgrids")
 	}
 
-	err := tileset.db.QueryRow("select grid from grids where zoom_level = ? and tile_column = ? and tile_row = ?", z, x, y).Scan(data)
+	/*err := tileset.db.QueryRow("select grid from grids where zoom_level = ? and tile_column = ? and tile_row = ?", z, x, y).Scan(data)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			*data = nil // If this tile does not exist in the database, return empty bytes
@@ -262,7 +291,7 @@ func (tileset *DB) ReadGrid(z uint8, x uint64, y uint64, data *[]byte) error {
 		return err
 	}
 	zwriter.Close()
-	*data = buf.Bytes()
+	*data = buf.Bytes()*/
 
 	return nil
 }
@@ -270,44 +299,53 @@ func (tileset *DB) ReadGrid(z uint8, x uint64, y uint64, data *[]byte) error {
 // ReadMetadata reads the metadata table into a map, casting their values into
 // the appropriate type
 func (tileset *DB) ReadMetadata() (map[string]interface{}, error) {
-	var (
-		key   string
-		value string
-	)
+	tileset.mux.Lock()
+	defer tileset.mux.Unlock()
+
 	metadata := make(map[string]interface{})
 
-	rows, err := tileset.db.Query("select * from metadata where value is not ''")
+	err := tileset.db.Select(
+		"metadata",
+		func(r sqlittle.Row) {
+			var (
+				name  string
+				value string
+				err   error
+			)
+			_ = r.Scan(&name, &value)
+			if len(value) == 0 {
+				return
+			}
+
+			switch name {
+			case "maxzoom", "minzoom":
+				metadata[name], err = strconv.Atoi(value)
+				if err != nil {
+					//return nil, fmt.Errorf("cannot read metadata item %s: %v", key, err)
+				}
+			case "bounds", "center":
+				metadata[name], err = stringToFloats(value)
+				if err != nil {
+					//return nil, fmt.Errorf("cannot read metadata item %s: %v", key, err)
+				}
+			case "json":
+				err = json.Unmarshal([]byte(value), &metadata)
+				if err != nil {
+					//return nil, fmt.Errorf("unable to parse JSON metadata item: %v", err)
+				}
+			default:
+				metadata[name] = value
+			}
+		},
+		"name",
+		"value",
+	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		rows.Scan(&key, &value)
-
-		switch key {
-		case "maxzoom", "minzoom":
-			metadata[key], err = strconv.Atoi(value)
-			if err != nil {
-				return nil, fmt.Errorf("cannot read metadata item %s: %v", key, err)
-			}
-		case "bounds", "center":
-			metadata[key], err = stringToFloats(value)
-			if err != nil {
-				return nil, fmt.Errorf("cannot read metadata item %s: %v", key, err)
-			}
-		case "json":
-			err = json.Unmarshal([]byte(value), &metadata)
-			if err != nil {
-				return nil, fmt.Errorf("unable to parse JSON metadata item: %v", err)
-			}
-		default:
-			metadata[key] = value
-		}
-	}
 
 	// Supplement missing values by inferring from available data
-	_, hasMinZoom := metadata["minzoom"]
+	/*_, hasMinZoom := metadata["minzoom"]
 	_, hasMaxZoom := metadata["maxzoom"]
 	if !(hasMinZoom && hasMaxZoom) {
 		var minZoom, maxZoom int
@@ -317,7 +355,7 @@ func (tileset *DB) ReadMetadata() (map[string]interface{}, error) {
 		}
 		metadata["minzoom"] = minZoom
 		metadata["maxzoom"] = maxZoom
-	}
+	}*/
 	return metadata, nil
 }
 
